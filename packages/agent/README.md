@@ -360,6 +360,34 @@ agent.clearAllQueues();
 
 Use clearSteeringQueue, clearFollowUpQueue, or clearAllQueues to drop queued messages.
 
+### Native queue evidence (experimental)
+
+```typescript
+const snapshot = agent.getQueueSnapshot();
+// snapshot.steering / followUp: still pending native queue occurrences
+// snapshot.claimed: already acquired by the loop, not yet at message_end
+const removed = agent.clearQueuedMessages();
+// removed.steering / followUp: only occurrences actually removed
+```
+
+Each occurrence has an Agent-local `id`, its originating `queue` (`steering` or `followUp`), and the original `message` reference. IDs are distinct even when the same message object is enqueued twice, and are not reused by `reset()`. Snapshot arrays are copies, not live arrays; message objects are not deep-cloned or frozen. These are pull observations and synchronous removal receipts, not an additional callback stream or durable journal.
+
+In `all` mode, a whole batch can already be claimed while its later messages have not emitted `message_start`. Clearing cannot recall those items. `message_start` and `message_end` emitted by `Agent` carry `queueItemId` for queued occurrences, without adding fields to the message/model payload. Direct prompts and raw low-level loop callers do not receive a queue ID. Claimed entries are released at message_end or run settlement; a claim does not guarantee delivery or session-file persistence, especially if a listener fails.
+
+This API describes the native queues, not `AgentSession`'s display projection. Native removal and display publication can fail independently. The experimental Session `removeQueuedMessages(ids)` reconciles only the actually removed rows and returns a native receipt even if display publication throws. Do not follow selective native removal with a global Session clear: that would remove newer messages too. These methods do not cancel a pending preflight, stop an active run, rewind history, or decide which user's draft to restore.
+
+### Targeted removal and delivery tags (Q2 prototype)
+
+```typescript
+const item = agent.enqueueMessage(message, "steering", "opaque-delivery-tag");
+const removed = agent.removeQueuedMessages([item.id]);
+await agent.promptWithDelivery([{ message, deliveryId: "direct-delivery-tag" }]);
+```
+
+`enqueueMessage` returns its occurrence synchronously, with no observer callback. `removeQueuedMessages` selects Agent-local IDs, never text or object identity; duplicates are harmless, and missing/claimed IDs are not reported as removed. Capture the owning Agent when scheduling an operation: an ID from another Agent is not a valid target even if its number matches.
+
+An optional `deliveryId` is forwarded on `message_start`/`message_end` only for that delivery, outside the message payload. Direct duplicate objects can carry different tags, and subsequent raw reuse does not inherit a tag. Tags are correlation data supplied by a cooperating caller, not an authentication or security boundary. Legacy calls and low-level loops may have no tag. Session/request attribution still requires explicit registration by the caller; no ambient async-scope inference is performed.
+
 When steering messages are detected after a turn completes:
 1. All tool calls from the current assistant message have already finished
 2. Steering messages are injected

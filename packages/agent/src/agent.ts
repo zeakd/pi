@@ -8,6 +8,7 @@ import type {
 	Transport,
 } from "@earendil-works/pi-ai";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { DeliveryLifecycle, type NativeRunDeliveryReport } from "./delivery-lifecycle.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -17,11 +18,14 @@ import type {
 	AgentLoopConfig,
 	AgentLoopTurnUpdate,
 	AgentMessage,
+	AgentQueueRemoval,
+	AgentQueueSnapshot,
 	AgentState,
 	AgentTool,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
 	PrepareNextTurnContext,
+	QueuedMessage,
 	QueueMode,
 	StreamFn,
 	ToolExecutionMode,
@@ -121,22 +125,26 @@ export interface AgentOptions {
 }
 
 class PendingMessageQueue {
-	private messages: AgentMessage[] = [];
+	private messages: QueuedMessage[] = [];
 	public mode: QueueMode;
 
 	constructor(mode: QueueMode) {
 		this.mode = mode;
 	}
 
-	enqueue(message: AgentMessage): void {
+	enqueue(message: QueuedMessage): void {
 		this.messages.push(message);
+	}
+
+	snapshot(): readonly QueuedMessage[] {
+		return this.messages.slice();
 	}
 
 	hasItems(): boolean {
 		return this.messages.length > 0;
 	}
 
-	drain(): AgentMessage[] {
+	drain(): QueuedMessage[] {
 		if (this.mode === "all") {
 			const drained = this.messages.slice();
 			this.messages = [];
@@ -151,8 +159,10 @@ class PendingMessageQueue {
 		return [first];
 	}
 
-	clear(): void {
-		this.messages = [];
+	clear(ids?: ReadonlySet<number>): QueuedMessage[] {
+		const removed = ids ? this.messages.filter((item) => ids.has(item.id)) : this.messages;
+		this.messages = ids ? this.messages.filter((item) => !ids.has(item.id)) : [];
+		return removed;
 	}
 }
 
@@ -173,6 +183,17 @@ export class Agent {
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
 	private readonly steeringQueue: PendingMessageQueue;
 	private readonly followUpQueue: PendingMessageQueue;
+	private nextQueueItemId = 0;
+	private claimedQueueItems: QueuedMessage[] = [];
+	private currentQueueItem?: QueuedMessage;
+	private directDeliveries: { message: AgentMessage; deliveryId?: string }[] = [];
+	private currentDeliveryId?: string;
+	private readonly deliveryLifecycle = new DeliveryLifecycle();
+
+	/** Last settled native run; immutable, bounded to one report. Not Session persistence evidence. */
+	getLastRunDeliveryReport(): NativeRunDeliveryReport | undefined {
+		return this.deliveryLifecycle.lastReport();
+	}
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -274,12 +295,25 @@ export class Agent {
 
 	/** Queue a message to be injected after the current assistant turn finishes. */
 	steer(message: AgentMessage): void {
-		this.steeringQueue.enqueue(message);
+		this.enqueueMessage(message, "steering");
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
 	followUp(message: AgentMessage): void {
-		this.followUpQueue.enqueue(message);
+		this.enqueueMessage(message, "followUp");
+	}
+
+	/** Enqueue with a synchronous occurrence receipt and optional caller-owned delivery tag. */
+	enqueueMessage(message: AgentMessage, queue: "steering" | "followUp", deliveryId?: string): QueuedMessage {
+		const item = Object.freeze({ id: ++this.nextQueueItemId, queue, message, ...(deliveryId ? { deliveryId } : {}) });
+		(queue === "steering" ? this.steeringQueue : this.followUpQueue).enqueue(item);
+		return item;
+	}
+
+	/** Remove only the specified pending occurrences. Missing/claimed IDs are not reported as removed. */
+	removeQueuedMessages(ids: readonly number[]): AgentQueueRemoval {
+		const selected = new Set(ids);
+		return { steering: this.steeringQueue.clear(selected), followUp: this.followUpQueue.clear(selected) };
 	}
 
 	/** Remove all queued steering messages. */
@@ -296,6 +330,30 @@ export class Agent {
 	clearAllQueues(): void {
 		this.clearSteeringQueue();
 		this.clearFollowUpQueue();
+	}
+
+	/** Inspect actual native membership without inferring it from text or event timing. */
+	getQueueSnapshot(): AgentQueueSnapshot {
+		return {
+			steering: this.steeringQueue.snapshot(),
+			followUp: this.followUpQueue.snapshot(),
+			claimed: this.claimedQueueItems.slice(),
+		};
+	}
+
+	/** Clear both native queues and return only the occurrences actually removed.
+	 * Does not clear AgentSession's legacy text display queues or cancel preflight.
+	 * No observer callbacks run between removal of the two queues.
+	 */
+	clearQueuedMessages(): AgentQueueRemoval {
+		return { steering: this.steeringQueue.clear(), followUp: this.followUpQueue.clear() };
+	}
+
+	private claim(queue: PendingMessageQueue): AgentMessage[] {
+		const items = queue.drain();
+		this.claimedQueueItems.push(...items);
+		this.deliveryLifecycle.claim(items);
+		return items.map((item) => item.message);
 	}
 
 	/** Returns true when either queue still contains pending messages. */
@@ -346,6 +404,13 @@ export class Agent {
 		await this.runPromptMessages(messages);
 	}
 
+	/** Start direct deliveries with tags outside the message payload. Tags are scoped to this invocation only. */
+	async promptWithDelivery(messages: readonly { message: AgentMessage; deliveryId?: string }[]): Promise<void> {
+		if (this.activeRun) throw new Error("Agent is already processing.");
+		this.directDeliveries = messages.map((item) => ({ ...item }));
+		await this.runPromptMessages(messages.map((item) => item.message));
+	}
+
 	/** Continue from the current transcript. The last message must be a user or tool-result message. */
 	async continue(): Promise<void> {
 		if (this.activeRun) {
@@ -358,13 +423,13 @@ export class Agent {
 		}
 
 		if (lastMessage.role === "assistant") {
-			const queuedSteering = this.steeringQueue.drain();
+			const queuedSteering = this.claim(this.steeringQueue);
 			if (queuedSteering.length > 0) {
 				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
 				return;
 			}
 
-			const queuedFollowUps = this.followUpQueue.drain();
+			const queuedFollowUps = this.claim(this.followUpQueue);
 			if (queuedFollowUps.length > 0) {
 				await this.runPromptMessages(queuedFollowUps);
 				return;
@@ -462,9 +527,9 @@ export class Agent {
 					skipInitialSteeringPoll = false;
 					return [];
 				}
-				return this.steeringQueue.drain();
+				return this.claim(this.steeringQueue);
 			},
-			getFollowUpMessages: async () => this.followUpQueue.drain(),
+			getFollowUpMessages: async () => this.claim(this.followUpQueue),
 		};
 	}
 
@@ -479,6 +544,8 @@ export class Agent {
 			resolvePromise = resolve;
 		});
 		this.activeRun = { promise, resolve: resolvePromise, abortController };
+		this.deliveryLifecycle.start([...this.directDeliveries, ...this.claimedQueueItems]);
+		let failed = false;
 
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;
@@ -487,8 +554,10 @@ export class Agent {
 		try {
 			await executor(abortController.signal);
 		} catch (error) {
+			failed = true;
 			await this.handleRunFailure(error, abortController.signal.aborted);
 		} finally {
+			this.deliveryLifecycle.settle(failed, abortController.signal.aborted);
 			this.finishRun();
 		}
 	}
@@ -512,6 +581,10 @@ export class Agent {
 	}
 
 	private finishRun(): void {
+		this.claimedQueueItems = [];
+		this.currentQueueItem = undefined;
+		this.directDeliveries = [];
+		this.currentDeliveryId = undefined;
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
@@ -528,15 +601,33 @@ export class Agent {
 	 */
 	private async processEvents(event: AgentEvent): Promise<void> {
 		switch (event.type) {
-			case "message_start":
+			case "message_start": {
+				const message = event.message;
+				const direct = this.directDeliveries[0]?.message === message ? this.directDeliveries.shift() : undefined;
+				this.currentQueueItem = direct
+					? undefined
+					: this.claimedQueueItems.find((item) => item.message === message);
+				this.currentDeliveryId = direct?.deliveryId ?? this.currentQueueItem?.deliveryId;
+				this.deliveryLifecycle.started(this.currentDeliveryId);
+				if (this.currentQueueItem) event = { ...event, queueItemId: this.currentQueueItem.id };
+				if (this.currentDeliveryId) event = { ...event, deliveryId: this.currentDeliveryId };
 				this._state.streamingMessage = event.message;
 				break;
+			}
 
 			case "message_update":
 				this._state.streamingMessage = event.message;
 				break;
 
 			case "message_end":
+				this.deliveryLifecycle.ended(this.currentDeliveryId);
+				if (this.currentDeliveryId) event = { ...event, deliveryId: this.currentDeliveryId };
+				this.currentDeliveryId = undefined;
+				if (this.currentQueueItem?.message === event.message) {
+					event = { ...event, queueItemId: this.currentQueueItem.id };
+					this.claimedQueueItems = this.claimedQueueItems.filter((item) => item !== this.currentQueueItem);
+				}
+				this.currentQueueItem = undefined;
 				this._state.streamingMessage = undefined;
 				this._state.messages.push(event.message);
 				break;

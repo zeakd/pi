@@ -3,6 +3,7 @@ export { uuidv7 } from "@earendil-works/pi-ai";
 export * from "./agent.ts";
 // Loop functions
 export * from "./agent-loop.ts";
+export type { NativeDeliveryOutcome, NativeRunDeliveryReport } from "./delivery-lifecycle.ts";
 export * from "./harness/agent-harness.ts";
 export {
 	type BranchPreparation,

@@ -55,6 +55,7 @@ import type { KeybindingsManager } from "../keybindings.ts";
 import type { CustomMessage } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
+import type { RequestEffects } from "../request-effects.ts";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
@@ -305,6 +306,8 @@ export interface CompactOptions {
 export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
 export interface ExtensionContext {
+	/** Explicit request-bound effects for producer preflight/commands, not an inferred shared-run owner. */
+	readonly request?: RequestEffects;
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
 	/** Current run mode. Use "tui" to guard terminal-only UI such as custom components. */
@@ -1620,6 +1623,7 @@ export interface ExtensionActions {
  * Required by all modes.
  */
 export interface ExtensionContextActions {
+	isManagedEffects?: () => boolean;
 	getModel: () => Model<any> | undefined;
 	getScopedModels: () => readonly ScopedModel[];
 	isIdle: () => boolean;

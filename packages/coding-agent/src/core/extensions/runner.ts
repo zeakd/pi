@@ -10,7 +10,8 @@ import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
-import type { SessionManager } from "../session-manager.ts";
+import { ManagedEffectUnsupportedError, type RequestEffects } from "../request-effects.ts";
+import type { ReadonlySessionManager, SessionManager } from "../session-manager.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
 import type {
 	BeforeAgentStartEvent,
@@ -278,6 +279,7 @@ export class ExtensionRunner {
 	private isIdleFn: () => boolean = () => true;
 	private isProjectTrustedFn: () => boolean = () => true;
 	private getSignalFn: () => AbortSignal | undefined = () => undefined;
+	private isManagedEffectsFn: () => boolean = () => false;
 	private waitForIdleFn: () => Promise<void> = async () => {};
 	private abortFn: () => void = () => {};
 	private hasPendingMessagesFn: () => boolean = () => false;
@@ -294,6 +296,11 @@ export class ExtensionRunner {
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
+	private contextsPublished = false;
+
+	get hasPublishedContexts(): boolean {
+		return this.contextsPublished;
+	}
 
 	constructor(
 		extensions: Extension[],
@@ -336,6 +343,7 @@ export class ExtensionRunner {
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
 
 		// Context actions (required)
+		this.isManagedEffectsFn = contextActions.isManagedEffects ?? (() => false);
 		this.getModel = contextActions.getModel;
 		this.getScopedModels = contextActions.getScopedModels;
 		this.isIdleFn = contextActions.isIdle;
@@ -665,11 +673,76 @@ export class ExtensionRunner {
 	 * Create an ExtensionContext for use in event handlers and tool execution.
 	 * Context values are resolved at call time, so changes via bindCore/bindUI are reflected.
 	 */
-	createContext(): ExtensionContext {
+	createContext(request?: RequestEffects): ExtensionContext {
+		this.contextsPublished = true;
 		const runner = this;
+		// A view object, not a cast of the live writer. Results are detached from stored data.
+		const readSession: ReadonlySessionManager = {
+			getCwd: () => {
+				runner.assertActive();
+				return runner.sessionManager.getCwd();
+			},
+			getSessionDir: () => {
+				runner.assertActive();
+				return runner.sessionManager.getSessionDir();
+			},
+			getSessionId: () => {
+				runner.assertActive();
+				return runner.sessionManager.getSessionId();
+			},
+			getSessionFile: () => {
+				runner.assertActive();
+				return runner.sessionManager.getSessionFile();
+			},
+			getLeafId: () => {
+				runner.assertActive();
+				return runner.sessionManager.getLeafId();
+			},
+			getLeafEntry: () => {
+				runner.assertActive();
+				return structuredClone(runner.sessionManager.getLeafEntry());
+			},
+			getEntry: (id) => {
+				runner.assertActive();
+				return structuredClone(runner.sessionManager.getEntry(id));
+			},
+			getLabel: (id) => {
+				runner.assertActive();
+				return runner.sessionManager.getLabel(id);
+			},
+			getBranch: (id) => {
+				runner.assertActive();
+				return structuredClone(runner.sessionManager.getBranch(id));
+			},
+			buildContextEntries: () => {
+				runner.assertActive();
+				return structuredClone(runner.sessionManager.buildContextEntries());
+			},
+			getHeader: () => {
+				runner.assertActive();
+				return structuredClone(runner.sessionManager.getHeader());
+			},
+			getEntries: () => {
+				runner.assertActive();
+				return structuredClone(runner.sessionManager.getEntries());
+			},
+			getTree: () => {
+				runner.assertActive();
+				return structuredClone(runner.sessionManager.getTree());
+			},
+			getSessionName: () => {
+				runner.assertActive();
+				return runner.sessionManager.getSessionName();
+			},
+		};
+		Object.freeze(readSession);
 		const getModel = this.getModel;
 		const getScopedModels = this.getScopedModels;
 		return {
+			get request() {
+				runner.assertActive();
+				return request;
+			},
 			get ui() {
 				runner.assertActive();
 				return runner.uiContext;
@@ -688,19 +761,20 @@ export class ExtensionRunner {
 			},
 			get sessionManager() {
 				runner.assertActive();
-				return runner.sessionManager;
+				return runner.isManagedEffectsFn() ? readSession : runner.sessionManager;
 			},
 			get modelRegistry() {
 				runner.assertActive();
+				if (runner.isManagedEffectsFn()) throw new ManagedEffectUnsupportedError("mutable extension ModelRegistry");
 				return runner.modelRegistry;
 			},
 			get model() {
 				runner.assertActive();
-				return getModel();
+				return runner.isManagedEffectsFn() ? structuredClone(getModel()) : getModel();
 			},
 			get scopedModels() {
 				runner.assertActive();
-				return getScopedModels();
+				return runner.isManagedEffectsFn() ? structuredClone(getScopedModels()) : getScopedModels();
 			},
 			get thinkingLevel() {
 				runner.assertActive();
@@ -716,7 +790,7 @@ export class ExtensionRunner {
 			},
 			get signal() {
 				runner.assertActive();
-				return runner.getSignalFn();
+				return request?.signal ?? runner.getSignalFn();
 			},
 			abort: () => {
 				runner.assertActive();
@@ -745,17 +819,19 @@ export class ExtensionRunner {
 		};
 	}
 
-	createCommandContext(): ExtensionCommandContext {
+	createCommandContext(request?: RequestEffects): ExtensionCommandContext {
 		// Use property descriptors instead of object spread so the guarded getters from
 		// createContext() stay lazy. A spread would eagerly read them once and freeze the
 		// old values into the returned object, bypassing stale-instance checks.
 		const context = Object.defineProperties(
 			{},
-			Object.getOwnPropertyDescriptors(this.createContext()),
+			Object.getOwnPropertyDescriptors(this.createContext(request)),
 		) as ExtensionCommandContext;
 		context.getSystemPromptOptions = () => {
 			this.assertActive();
-			return this.getSystemPromptOptionsFn();
+			return this.isManagedEffectsFn()
+				? structuredClone(this.getSystemPromptOptionsFn())
+				: this.getSystemPromptOptionsFn();
 		};
 		context.waitForIdle = () => {
 			this.assertActive();
@@ -763,22 +839,27 @@ export class ExtensionRunner {
 		};
 		context.newSession = (options) => {
 			this.assertActive();
+			if (this.isManagedEffectsFn()) throw new ManagedEffectUnsupportedError("extension newSession");
 			return this.newSessionHandler(options);
 		};
 		context.fork = (entryId, options) => {
 			this.assertActive();
+			if (this.isManagedEffectsFn()) throw new ManagedEffectUnsupportedError("extension fork");
 			return this.forkHandler(entryId, options);
 		};
 		context.navigateTree = (targetId, options) => {
 			this.assertActive();
+			if (this.isManagedEffectsFn()) throw new ManagedEffectUnsupportedError("extension navigateTree");
 			return this.navigateTreeHandler(targetId, options);
 		};
 		context.switchSession = (sessionPath, options) => {
 			this.assertActive();
+			if (this.isManagedEffectsFn()) throw new ManagedEffectUnsupportedError("extension switchSession");
 			return this.switchSessionHandler(sessionPath, options);
 		};
 		context.reload = () => {
 			this.assertActive();
+			if (this.isManagedEffectsFn()) throw new ManagedEffectUnsupportedError("extension reload");
 			return this.reloadHandler();
 		};
 		return context;
@@ -793,8 +874,11 @@ export class ExtensionRunner {
 		);
 	}
 
-	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
-		const ctx = this.createContext();
+	async emit<TEvent extends RunnerEmitEvent>(
+		event: TEvent,
+		request?: RequestEffects,
+	): Promise<RunnerEmitResult<TEvent>> {
+		const ctx = this.createContext(request);
 		let result: SessionBeforeEventResult | undefined;
 
 		for (const ext of this.extensions) {
@@ -802,8 +886,11 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				request?.assertActive();
 				try {
+					request?.assertActive();
 					const handlerResult = await handler(event, ctx);
+					request?.assertActive();
 
 					if (this.isSessionBeforeEvent(event) && handlerResult) {
 						result = handlerResult as SessionBeforeEventResult;
@@ -824,6 +911,7 @@ export class ExtensionRunner {
 			}
 		}
 
+		request?.assertActive();
 		return result as RunnerEmitResult<TEvent>;
 	}
 
@@ -1078,11 +1166,12 @@ export class ExtensionRunner {
 		images: ImageContent[] | undefined,
 		systemPrompt: string,
 		systemPromptOptions: BuildSystemPromptOptions,
+		request?: RequestEffects,
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
 		let currentSystemPrompt = systemPrompt;
 		const ctx = Object.defineProperties(
 			{},
-			Object.getOwnPropertyDescriptors(this.createContext()),
+			Object.getOwnPropertyDescriptors(this.createContext(request)),
 		) as ExtensionContext;
 		ctx.getSystemPrompt = () => {
 			this.assertActive();
@@ -1096,20 +1185,22 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				request?.assertActive();
 				try {
 					const event: BeforeAgentStartEvent = {
 						type: "before_agent_start",
 						prompt,
-						images,
+						images: request ? structuredClone(images) : images,
 						systemPrompt: currentSystemPrompt,
-						systemPromptOptions,
+						systemPromptOptions: request ? structuredClone(systemPromptOptions) : systemPromptOptions,
 					};
 					const handlerResult = await handler(event, ctx);
+					request?.assertActive();
 
 					if (handlerResult) {
 						const result = handlerResult as BeforeAgentStartEventResult;
 						if (result.message) {
-							messages.push(result.message);
+							messages.push(request ? structuredClone(result.message) : result.message);
 						}
 						if (result.systemPrompt !== undefined) {
 							currentSystemPrompt = result.systemPrompt;
@@ -1129,6 +1220,7 @@ export class ExtensionRunner {
 			}
 		}
 
+		request?.assertActive();
 		if (messages.length > 0 || systemPromptModified) {
 			return {
 				messages: messages.length > 0 ? messages : undefined,
@@ -1193,26 +1285,33 @@ export class ExtensionRunner {
 		images: ImageContent[] | undefined,
 		source: InputSource,
 		streamingBehavior?: "steer" | "followUp",
+		request?: RequestEffects,
 	): Promise<InputEventResult> {
-		const ctx = this.createContext();
+		const ctx = this.createContext(request);
 		let currentText = text;
 		let currentImages = images;
 
 		for (const ext of this.extensions) {
 			for (const handler of ext.handlers.get("input") ?? []) {
+				request?.assertActive();
 				try {
 					const event: InputEvent = {
 						type: "input",
 						text: currentText,
-						images: currentImages,
+						images: request ? structuredClone(currentImages) : currentImages,
 						source,
 						streamingBehavior,
 					};
 					const result = (await handler(event, ctx)) as InputEventResult | undefined;
+					request?.assertActive();
 					if (result?.action === "handled") return result;
 					if (result?.action === "transform") {
 						currentText = result.text;
-						currentImages = result.images ?? currentImages;
+						currentImages = result.images
+							? request
+								? structuredClone(result.images)
+								: result.images
+							: currentImages;
 					}
 				} catch (err) {
 					this.emitError({
@@ -1224,6 +1323,7 @@ export class ExtensionRunner {
 				}
 			}
 		}
+		request?.assertActive();
 		return currentText !== text || currentImages !== images
 			? { action: "transform", text: currentText, images: currentImages }
 			: { action: "continue" };

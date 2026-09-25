@@ -165,6 +165,37 @@ export {
 } from "./core/extensions/index.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
+export {
+	type CreateManagedSessionOptions,
+	type CreateManagedSessionResult,
+	createManagedSession,
+	type DeliverySnapshot,
+	type ForgetBlocker,
+	type ForgetMessagesResult,
+	type InvocationSnapshot,
+	type ManagedExecutionSnapshot,
+	type ManagedSession,
+	type PromptInvocation,
+	type PromptInvocationSnapshot,
+	type RemoveMessagesResult,
+	type RequestHandle,
+	type RequestLifetimeSnapshot,
+	type RequestMessages,
+	type RequestMessagesSnapshot,
+	type RequestPromptOptions,
+	type RequestSelection,
+	type StopExecutionResult,
+} from "./core/managed-session.ts";
+export type {
+	MessageDeliveryEvidence,
+	MessageObservation,
+	MessageObservationEnd,
+	MessageSubmissionReceipt,
+	MessageSubmissionSnapshot,
+	RequestDeliveryRecord,
+	RequestMessageRecord,
+	ScopeMessageRecords,
+} from "./core/message-evidence.ts";
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {
@@ -189,6 +220,29 @@ export type {
 	ResolvedResource,
 } from "./core/package-manager.ts";
 export { DefaultPackageManager } from "./core/package-manager.ts";
+export {
+	type EntryMutationReceipt,
+	ManagedEffectRequiredError,
+	ManagedEffectUnsupportedError,
+	type RequestEffects,
+} from "./core/request-effects.ts";
+export type {
+	DeliveryId,
+	EntryId,
+	ExecutionId,
+	InvocationId,
+	MessageInvocationResult,
+	RequestId,
+} from "./core/request-ids.ts";
+export {
+	type ExecutionSnapshot,
+	ExecutionStoppedError,
+	RequestInvalidatedError,
+	type RequestScope,
+	type RequestScopeSnapshot,
+	SessionExecutionBusyError,
+	StalePreparationError,
+} from "./core/request-lifetime.ts";
 export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.ts";
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
 // SDK for programmatic usage

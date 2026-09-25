@@ -19,6 +19,7 @@ import type {
 	Agent,
 	AgentEvent,
 	AgentMessage,
+	AgentQueueRemoval,
 	AgentState,
 	AgentTool,
 	PrepareNextTurnContext,
@@ -92,10 +93,26 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { type EvidenceInvocation, MessageEvidence, type MessageSubmissionReceipt } from "./message-evidence.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
+import {
+	type EntryMutationReceipt,
+	ManagedEffectRequiredError,
+	ManagedEffectUnsupportedError,
+	type RequestEffects,
+} from "./request-effects.ts";
+import type { EntryId, InvocationId, MessageInvocationResult, RequestId } from "./request-ids.ts";
+import {
+	type ExecutionLease,
+	type ExecutionSnapshot,
+	RequestLifetimes,
+	type RequestScope,
+	type RequestScopeSnapshot,
+	StalePreparationError,
+} from "./request-lifetime.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
@@ -236,6 +253,10 @@ export interface ExtensionBindings {
 
 /** Options for AgentSession.prompt() */
 export interface PromptOptions {
+	/** Explicit lifetime authority. Invalidation blocks future admission, not already accepted deliveries. */
+	scope?: RequestScope;
+	/** Optional single-use receipt created by this Session before calling prompt. */
+	receipt?: MessageSubmissionReceipt;
 	/** Whether to expand file-based prompt templates (default: true) */
 	expandPromptTemplates?: boolean;
 	/** Image attachments */
@@ -315,11 +336,18 @@ export class AgentSession {
 	private _resolveIdleWait: (() => void) | undefined;
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
-	private _steeringMessages: string[] = [];
+	private _steeringMessages: { text: string; queueItemId?: number }[] = [];
 	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
-	private _followUpMessages: string[] = [];
+	private _followUpMessages: { text: string; queueItemId?: number }[] = [];
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
-	private _pendingNextTurnMessages: CustomMessage[] = [];
+	private _pendingNextTurnMessages: { message: CustomMessage; deliveryId?: string }[] = [];
+	private readonly _messageEvidence = new MessageEvidence();
+	private readonly _requestLifetimes = new RequestLifetimes();
+	private _lastNativeReport = 0;
+	private _managedEffects = false;
+	private _extensionsBound = false;
+	private _buildingRuntime = true;
+	private _legacyOperationStarted = false;
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
@@ -398,6 +426,7 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		this._buildingRuntime = false;
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -554,8 +583,8 @@ export class AgentSession {
 	private _emitQueueUpdate(): void {
 		this._emit({
 			type: "queue_update",
-			steering: [...this._steeringMessages],
-			followUp: [...this._followUpMessages],
+			steering: this._steeringMessages.map((item) => item.text),
+			followUp: this._followUpMessages.map((item) => item.text),
 		});
 	}
 
@@ -569,7 +598,7 @@ export class AgentSession {
 	}
 
 	private _resolveIdleWaitIfIdle(): void {
-		if (this._isAgentRunActive || !this._resolveIdleWait) {
+		if (!this.isIdle || !this._resolveIdleWait) {
 			return;
 		}
 		const resolve = this._resolveIdleWait;
@@ -593,23 +622,18 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
-		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
-		// This ensures the UI sees the updated queue state
-		if (event.type === "message_start" && event.message.role === "user") {
-			this._overflowRecoveryAttempted = false;
-			const messageText = contentText(event.message.content, "");
-			if (messageText) {
-				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
-				if (steeringIndex !== -1) {
-					this._steeringMessages.splice(steeringIndex, 1);
-					this._emitQueueUpdate();
-				} else {
-					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
-					if (followUpIndex !== -1) {
-						this._followUpMessages.splice(followUpIndex, 1);
+		if (event.type === "message_start") {
+			this._messageEvidence.accept(event.deliveryId, this._requestLifetimes.snapshot()?.id);
+			this._messageEvidence.update(event.deliveryId, { started: true });
+			if (event.message.role === "user") this._overflowRecoveryAttempted = false;
+			// Queue identity, not equal text or an inherited async scope, owns the display row.
+			if (event.queueItemId !== undefined) {
+				for (const queue of [this._steeringMessages, this._followUpMessages]) {
+					const index = queue.findIndex((item) => item.queueItemId === event.queueItemId);
+					if (index !== -1) {
+						queue.splice(index, 1);
 						this._emitQueueUpdate();
+						break;
 					}
 				}
 			}
@@ -626,19 +650,21 @@ export class AgentSession {
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
-				this.sessionManager.appendCustomMessageEntry(
+				const entryId = this.sessionManager.appendCustomMessageEntry(
 					event.message.customType,
 					event.message.content,
 					event.message.display,
 					event.message.details,
 				);
+				this._messageEvidence.update(event.deliveryId, { entryId });
 			} else if (
 				event.message.role === "user" ||
 				event.message.role === "assistant" ||
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				const entryId = this.sessionManager.appendMessage(event.message);
+				this._messageEvidence.update(event.deliveryId, { entryId });
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
@@ -835,11 +861,12 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._requestLifetimes.closeScopes();
 		try {
-			this.abortRetry();
-			this.abortCompaction();
-			this.abortBranchSummary();
-			this.abortBash();
+			this._abortRetry();
+			this._abortCompaction();
+			this._abortBranchSummary();
+			this._abortBash();
 			this.agent.abort();
 		} catch {
 			// Dispose must succeed even if an abort hook throws.
@@ -848,6 +875,7 @@ export class AgentSession {
 		this._extensionRunner.invalidate(
 			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 		);
+		this._messageEvidence.close();
 		this._disconnectFromAgent();
 		this._eventListeners = [];
 		cleanupSessionResources(this.sessionId);
@@ -879,7 +907,7 @@ export class AgentSession {
 
 	/** Whether the session has no active agent run, retry, auto-compaction, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive;
+		return !this._isAgentRunActive && this._requestLifetimes.snapshot() === undefined;
 	}
 
 	/** Current effective system prompt (includes any per-turn extension modifications) */
@@ -924,6 +952,11 @@ export class AgentSession {
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
+		this._assertLegacyOperation("setActiveToolsByName; use request effects");
+		this._setActiveToolsByName(toolNames);
+	}
+
+	private _setActiveToolsByName(toolNames: string[]): void {
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
 		for (const name of toolNames) {
@@ -986,6 +1019,7 @@ export class AgentSession {
 
 	/** Update scoped models for cycling */
 	setScopedModels(scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>): void {
+		this._assertLegacyOperation("setScopedModels");
 		this._scopedModels = scopedModels;
 	}
 
@@ -1058,28 +1092,71 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
-	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+	private _recordNativeRun(lease: ExecutionLease): void {
+		const report = this.agent.getLastRunDeliveryReport();
+		if (!report || report.runId <= this._lastNativeReport) return;
+		this._messageEvidence.settleRun(report, lease.id);
+		this._lastNativeReport = report.runId;
+	}
+
+	private async _runAgentPrompt(
+		messages: AgentMessage | AgentMessage[],
+		deliveryIds?: Map<AgentMessage, string>,
+		reserved?: ExecutionLease,
+	): Promise<void> {
+		// Reserve before the try: a rejected competitor must never execute this run's cleanup.
+		const lease = reserved ?? this._requestLifetimes.reserve();
+		this._requestLifetimes.assertOwner(lease);
+		lease.phase = "running";
 		this._isAgentRunActive = true;
 		try {
-			await this.agent.prompt(messages);
-			while (await this._handlePostAgentRun()) {
-				await this.agent.continue();
+			try {
+				if (deliveryIds?.size) {
+					const batch = Array.isArray(messages) ? messages : [messages];
+					for (const id of deliveryIds.values()) this._messageEvidence.accept(id, lease.id);
+					await this.agent.promptWithDelivery(
+						batch.map((message) => ({ message, deliveryId: deliveryIds.get(message) })),
+					);
+				} else {
+					await this.agent.prompt(messages);
+				}
+			} finally {
+				this._recordNativeRun(lease);
+			}
+			while (
+				!lease.stopRequested &&
+				(await this._handlePostAgentRun(() => this._requestLifetimes.assertOwner(lease))) &&
+				!lease.stopRequested
+			) {
+				try {
+					await this.agent.continue();
+				} finally {
+					this._recordNativeRun(lease);
+				}
 			}
 		} finally {
-			this._systemPromptOverride = undefined;
-			this._flushPendingBashMessages();
-			await this._emitAgentSettled();
+			lease.phase = "settling";
+			try {
+				this._systemPromptOverride = undefined;
+				this._flushPendingBashMessages();
+				await this._emitAgentSettled();
+			} finally {
+				this._isAgentRunActive = false;
+				this._requestLifetimes.release(lease);
+				this._resolveIdleWaitIfIdle();
+			}
 		}
 	}
 
-	private async _handlePostAgentRun(): Promise<boolean> {
+	private async _handlePostAgentRun(assertCurrent: () => void): Promise<boolean> {
+		assertCurrent();
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
 		if (!msg) {
 			return false;
 		}
 
-		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
+		if (this._isRetryableError(msg) && (await this._prepareRetry(msg, assertCurrent))) {
 			return true;
 		}
 
@@ -1093,7 +1170,7 @@ export class AgentSession {
 			this._retryAttempt = 0;
 		}
 
-		if (await this._checkCompaction(msg)) {
+		if (await this._checkCompaction(msg, true, assertCurrent)) {
 			return true;
 		}
 
@@ -1111,18 +1188,256 @@ export class AgentSession {
 	 * @throws Error if streaming and no streamingBehavior specified
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
+	/** Create observation before invocation; no text/FIFO/snapshot-diff attribution. */
+	createMessageReceipt(): MessageSubmissionReceipt {
+		return this._messageEvidence.create();
+	}
+
+	/** Opt-in before any extension context is published. This cannot be disabled again. */
+	enableManagedEffects(): void {
+		if (this._managedEffects) return;
+		if (
+			this._extensionsBound ||
+			this._legacyOperationStarted ||
+			this._extensionRunner.hasPublishedContexts ||
+			this._requestLifetimes.hasInvocations ||
+			!this.isIdle ||
+			this.isCompacting ||
+			this.isBashRunning ||
+			this.agent.hasQueuedMessages() ||
+			this._pendingNextTurnMessages.length ||
+			this._pendingBashMessages.length
+		) {
+			throw new Error("Enable managed effects before binding extensions or starting operations");
+		}
+		this._managedEffects = true;
+	}
+
+	get hasManagedEffects(): boolean {
+		return this._managedEffects;
+	}
+
+	private _conversationVersion(): string {
+		// Append-only metadata is a separate lane and must not invalidate a prepared conversation.
+		return this.sessionManager
+			.getBranch()
+			.filter(
+				(entry) =>
+					entry.type === "message" ||
+					entry.type === "custom_message" ||
+					entry.type === "compaction" ||
+					entry.type === "branch_summary",
+			)
+			.map((entry) => entry.id)
+			.join(":");
+	}
+
+	private _assertManagedScope(scope?: RequestScope): void {
+		if (!this._managedEffects) this._legacyOperationStarted = true;
+		if (this._managedEffects && !scope) throw new ManagedEffectRequiredError();
+		this._requestLifetimes.check(scope);
+	}
+
+	private _assertLegacyOperation(operation: string): void {
+		if (!this._buildingRuntime) this._legacyOperationStarted = true;
+		if (this._managedEffects) throw new ManagedEffectUnsupportedError(operation);
+	}
+
+	private _commitConfiguration<T>(scope: RequestScope | undefined, mutation: () => T): T {
+		this._assertManagedScope(scope);
+		if (!this._managedEffects) return mutation();
+		const lease = this._requestLifetimes.reserve(scope);
+		try {
+			return mutation();
+		} finally {
+			this._requestLifetimes.release(lease);
+			this._resolveIdleWaitIfIdle();
+		}
+	}
+
+	private async _invokeRequestMessage(
+		scope: RequestScope,
+		receipt: MessageSubmissionReceipt | undefined,
+		operation: (observation: MessageSubmissionReceipt) => Promise<void>,
+	): Promise<MessageInvocationResult> {
+		this._requestLifetimes.check(scope);
+		const observation = receipt ?? this.createMessageReceipt();
+		try {
+			await operation(observation);
+			// Actual await settlement, not a possibly released observer's frozen snapshot.
+			return Object.freeze({ kind: "returned", invocationId: observation.id as InvocationId });
+		} finally {
+			if (!receipt) observation.release();
+		}
+	}
+
+	/** A capability tied to one scope/Session. No ambient request inference and no independent child authority. */
+	requestEffects(scope: RequestScope): RequestEffects {
+		this._assertManagedScope(scope);
+		const effects: RequestEffects = {
+			scopeId: scope.id as RequestId,
+			signal: scope.signal,
+			assertActive: () => this._requestLifetimes.check(scope),
+			invalidate: () => this.invalidateRequestScope(scope),
+			createMessageReceipt: () => {
+				this._requestLifetimes.check(scope);
+				return this.createMessageReceipt();
+			},
+			sendMessage: (message, options) =>
+				this._invokeRequestMessage(scope, options?.receipt, (receipt) =>
+					this.sendCustomMessage(message, { ...options, receipt, scope }),
+				),
+			sendUserMessage: (content, options) =>
+				this._invokeRequestMessage(scope, options?.receipt, (receipt) =>
+					this.sendUserMessage(content, { ...options, receipt, scope }),
+				),
+			appendEntry: (customType, data) => {
+				const value = structuredClone(data);
+				const entryId = this._requestLifetimes.commit(scope, () =>
+					this.sessionManager.appendCustomEntry(customType, value),
+				);
+				try {
+					const entry = this.sessionManager.getEntry(entryId);
+					if (entry) this._emit({ type: "entry_appended", entry: structuredClone(entry) });
+					return Object.freeze({ entryId: entryId as EntryId });
+				} catch (error) {
+					return Object.freeze({ entryId: entryId as EntryId, publicationError: String(error) });
+				}
+			},
+			setSessionName: async (name): Promise<EntryMutationReceipt> => {
+				const leave = this._requestLifetimes.enter(scope);
+				try {
+					const entryId = this._requestLifetimes.commit(scope, () => this.sessionManager.appendSessionInfo(name));
+					const event = { type: "session_info_changed" as const, name: this.sessionManager.getSessionName() };
+					const errors: string[] = [];
+					try {
+						this._emit(event);
+					} catch (error) {
+						errors.push(String(error));
+					}
+					try {
+						await this._extensionRunner.emit(event, effects);
+					} catch (error) {
+						errors.push(String(error));
+					}
+					return Object.freeze({
+						entryId: entryId as EntryId,
+						...(errors.length ? { publicationError: errors.join("; ") } : {}),
+					});
+				} finally {
+					leave();
+				}
+			},
+			setLabel: (entryId, label) =>
+				Object.freeze({
+					entryId: this._requestLifetimes.commit(scope, () =>
+						this.sessionManager.appendLabelChange(entryId, label),
+					) as EntryId,
+				}),
+			setModel: (model) => this.setModel(model, scope),
+			setThinkingLevel: (level) => this._commitConfiguration(scope, () => this._setThinkingLevel(level)),
+			setActiveTools: (names) => this._commitConfiguration(scope, () => this._setActiveToolsByName(names)),
+		};
+		return Object.freeze(effects);
+	}
+
+	createRequestScope(parent?: RequestScope): RequestScope {
+		return this._requestLifetimes.create(parent);
+	}
+
+	/** Blocks future managed admissions. Does not recall accepted queue items or stop a shared run. */
+	invalidateRequestScope(scope: RequestScope): RequestScopeSnapshot {
+		return this._requestLifetimes.invalidate(scope);
+	}
+
+	/** Message-producer coverage only; raw writers, metadata, arbitrary IO and execution participants are excluded. */
+	getRequestMessages(scope: RequestScope, options?: { includeDependents?: boolean }) {
+		const scopes = this._requestLifetimes.describe(scope, options?.includeDependents);
+		return Object.freeze({
+			coverage: "scoped-session-message-producers" as const,
+			tracking: this._messageEvidence.tracking,
+			scopes,
+			records: this._messageEvidence.forScopes(scopes.map((item) => item.id)),
+		});
+	}
+
+	/** Internal managed observation bridge. Current-state notifications are coalesced outside mutation boundaries. */
+	observeRequestMessages(scope: RequestScope, listener: () => void) {
+		this._requestLifetimes.describe(scope); // Validate identity, including invalidated/closed scopes.
+		return this._messageEvidence.observe(scope.id, listener);
+	}
+
+	/** Explicit history release, not cancellation or settlement. Keeps a forgotten-history marker. */
+	forgetRequestMessages(scope: RequestScope, options?: { includeDependents?: boolean }): void {
+		const scopes = this._requestLifetimes.describe(scope, options?.includeDependents);
+		if (
+			this._requestLifetimes.snapshot() ||
+			scopes.some((item) => !item.invalidated || item.pendingInvocations > 0)
+		) {
+			throw new Error("Cannot forget messages before scope invalidation and operation settlement");
+		}
+		this._messageEvidence.forget(scopes.map((item) => item.id));
+	}
+
+	getExecutionSnapshot(): ExecutionSnapshot | undefined {
+		return this._requestLifetimes.snapshot();
+	}
+
+	/** Explicitly stop this execution, possibly shared by several requests. Never targets a newer execution. */
+	async stopExecution(id: string): Promise<boolean> {
+		const lease = this._requestLifetimes.requestStop(id);
+		if (!lease) return false;
+		this._abortRetry();
+		this._abortCompaction();
+		this.agent.abort();
+		await lease.done;
+		return true;
+	}
+
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		this._assertManagedScope(options?.scope);
+		const leave = this._requestLifetimes.enter(options?.scope);
+		let invocation: EvidenceInvocation | undefined;
+		try {
+			invocation = this._messageEvidence.begin(options?.receipt, options?.scope?.id);
+			await this._prompt(text, options, invocation);
+			this._messageEvidence.finish(invocation);
+		} catch (error) {
+			this._messageEvidence.finish(invocation, String(error));
+			throw error;
+		} finally {
+			leave();
+		}
+	}
+
+	private async _prompt(
+		text: string,
+		options: PromptOptions | undefined,
+		invocation: EvidenceInvocation | undefined,
+	): Promise<void> {
+		const deliveryIds = new Map<AgentMessage, string>();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
-		const preflightResult = options?.preflightResult;
+		let reported = false;
+		const preflightResult = (accepted: boolean): void => {
+			if (reported) return;
+			reported = true;
+			options?.preflightResult?.(accepted);
+		};
+		const scope = options?.scope;
+		const effects = scope ? this.requestEffects(scope) : undefined;
+		let lease: ExecutionLease | undefined;
 		let messages: AgentMessage[] | undefined;
 
 		try {
+			this._requestLifetimes.check(scope);
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
-				const handled = await this._tryExecuteExtensionCommand(text);
+				const handled = await this._tryExecuteExtensionCommand(text, effects);
+				this._requestLifetimes.check(scope);
 				if (handled) {
 					// Extension command executed, no prompt to send
+					this._messageEvidence.outcome(invocation, "handled");
 					preflightResult?.(true);
 					return;
 				}
@@ -1130,15 +1445,18 @@ export class AgentSession {
 
 			// Emit input event for extension interception (before skill/template expansion)
 			let currentText = text;
-			let currentImages = options?.images;
+			let currentImages = this._managedEffects ? structuredClone(options?.images) : options?.images;
 			if (this._extensionRunner.hasHandlers("input")) {
 				const inputResult = await this._extensionRunner.emitInput(
 					currentText,
 					currentImages,
 					options?.source ?? "interactive",
 					this.isStreaming ? options?.streamingBehavior : undefined,
+					effects,
 				);
+				this._requestLifetimes.check(scope);
 				if (inputResult.action === "handled") {
+					this._messageEvidence.outcome(invocation, "handled");
 					preflightResult?.(true);
 					return;
 				}
@@ -1155,6 +1473,7 @@ export class AgentSession {
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
 
+			this._requestLifetimes.check(scope);
 			// If streaming, queue via steer() or followUp() based on option
 			if (this.isStreaming) {
 				if (!options?.streamingBehavior) {
@@ -1163,25 +1482,27 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+					await this._queueFollowUp(expandedText, currentImages, invocation, scope);
 				} else {
-					await this._queueSteer(expandedText, currentImages);
+					await this._queueSteer(expandedText, currentImages, invocation, scope);
 				}
+				this._messageEvidence.outcome(invocation, "submitted");
 				preflightResult?.(true);
 				return;
 			}
 
-			// Flush any pending bash messages before the new prompt
-			this._flushPendingBashMessages();
-
+			// Preparation does not acquire nextTurn messages or change the run's system prompt.
 			// Validate model
 			if (!this.model) {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
+			const authModel = this.model;
 			const hasConfiguredAuth =
-				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
-				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+				this._modelRuntime.hasConfiguredAuth(authModel.provider) ||
+				(await this._modelRuntime.checkAuth(authModel.provider)) !== undefined;
+			this._requestLifetimes.check(scope);
+			if (scope && this.model !== authModel) throw new StalePreparationError();
 			if (!hasConfiguredAuth) {
 				const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
 				if (isOAuth) {
@@ -1194,11 +1515,20 @@ export class AgentSession {
 				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 			}
 
-			// Check if we need to compact before sending (catches aborted responses).
-			// The user's new prompt is sent below, so do not call agent.continue() here.
-			const lastAssistant = this._findLastAssistantMessage();
-			if (lastAssistant) {
-				await this._checkCompaction(lastAssistant, false);
+			// Compaction is a conflicting shared operation. Its lease ends before long preflight hooks.
+			const preparation = this._requestLifetimes.reserve(scope);
+			const assertPreparation = (): void => {
+				this._requestLifetimes.check(scope);
+				this._requestLifetimes.assertOwner(preparation);
+			};
+			try {
+				this._flushPendingBashMessages();
+				const lastAssistant = this._findLastAssistantMessage();
+				if (lastAssistant) await this._checkCompaction(lastAssistant, false, assertPreparation);
+				assertPreparation();
+			} finally {
+				this._requestLifetimes.release(preparation);
+				this._resolveIdleWaitIfIdle();
 			}
 
 			// Build messages array (custom message if any, then user message)
@@ -1215,19 +1545,55 @@ export class AgentSession {
 				timestamp: Date.now(),
 			});
 
-			// Inject any pending "nextTurn" messages as context alongside the user message
-			for (const msg of this._pendingNextTurnMessages) {
-				messages.push(msg);
-			}
-			this._pendingNextTurnMessages = [];
+			const prepared = {
+				contextVersion: this._conversationVersion(),
+				model: this.model,
+				thinkingLevel: this.thinkingLevel,
+				basePrompt: this._baseSystemPrompt,
+				tools: this.agent.state.tools,
+				runner: this._extensionRunner,
+			};
+			const assertPrepared = (): void => {
+				this._requestLifetimes.check(scope);
+				if (
+					scope &&
+					(prepared.contextVersion !== this._conversationVersion() ||
+						prepared.model !== this.model ||
+						prepared.thinkingLevel !== this.thinkingLevel ||
+						prepared.basePrompt !== this._baseSystemPrompt ||
+						prepared.tools !== this.agent.state.tools ||
+						prepared.runner !== this._extensionRunner)
+				)
+					throw new StalePreparationError();
+			};
 
-			// Emit before_agent_start extension event
+			// Emit before_agent_start extension event without owning shared execution state.
 			const result = await this._extensionRunner.emitBeforeAgentStart(
 				expandedText,
 				currentImages,
 				this._baseSystemPrompt,
 				this._baseSystemPromptOptions,
+				effects,
 			);
+			assertPrepared();
+			lease = this._requestLifetimes.reserve(scope);
+			preflightResult(true);
+			// Acceptance callbacks can synchronously cancel or attempt another submission.
+			assertPrepared();
+			this._requestLifetimes.assertOwner(lease);
+
+			// No await or publication between this admission check and entering the owned run.
+			const userDeliveryId = this._messageEvidence.register(invocation, "user", "direct");
+			if (userDeliveryId) deliveryIds.set(messages[0], userDeliveryId);
+			for (const item of this._pendingNextTurnMessages) {
+				messages.push(item.message);
+				if (item.deliveryId) {
+					deliveryIds.set(item.message, item.deliveryId);
+					this._messageEvidence.update(item.deliveryId, { placement: "direct" });
+				}
+			}
+			this._pendingNextTurnMessages = [];
+
 			// Add all custom messages from extensions
 			if (result?.messages) {
 				for (const msg of result.messages) {
@@ -1240,6 +1606,8 @@ export class AgentSession {
 						details: msg.details,
 						timestamp: Date.now(),
 					});
+					const deliveryId = this._messageEvidence.register(invocation, "before-agent-start", "direct");
+					if (deliveryId) deliveryIds.set(messages[messages.length - 1], deliveryId);
 				}
 			}
 			// Apply extension-modified system prompt, or reset to base
@@ -1252,22 +1620,21 @@ export class AgentSession {
 				this.agent.state.systemPrompt = this._baseSystemPrompt;
 			}
 		} catch (error) {
-			preflightResult?.(false);
+			if (lease) this._requestLifetimes.release(lease);
+			this._resolveIdleWaitIfIdle();
+			preflightResult(false);
 			throw error;
 		}
 
-		if (!messages) {
-			return;
-		}
-
-		preflightResult?.(true);
-		await this._runAgentPrompt(messages);
+		if (!messages) return;
+		this._messageEvidence.outcome(invocation, "submitted");
+		await this._runAgentPrompt(messages, deliveryIds, lease);
 	}
 
 	/**
 	 * Try to execute an extension command. Returns true if command was found and executed.
 	 */
-	private async _tryExecuteExtensionCommand(text: string): Promise<boolean> {
+	private async _tryExecuteExtensionCommand(text: string, effects?: RequestEffects): Promise<boolean> {
 		// Parse command name and args
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
@@ -1277,10 +1644,12 @@ export class AgentSession {
 		if (!command) return false;
 
 		// Get command context from extension runner (includes session control methods)
-		const ctx = this._extensionRunner.createCommandContext();
+		const ctx = this._extensionRunner.createCommandContext(effects);
 
 		try {
+			effects?.assertActive();
 			await command.handler(args, ctx);
+			effects?.assertActive();
 			return true;
 		} catch (err) {
 			// Emit error via extension runner
@@ -1332,17 +1701,13 @@ export class AgentSession {
 	 * @param images Optional image attachments to include with the message
 	 * @throws Error if text is an extension command
 	 */
-	async steer(text: string, images?: ImageContent[]): Promise<void> {
-		// Check for extension commands (cannot be queued)
-		if (text.startsWith("/")) {
-			this._throwIfExtensionCommand(text);
-		}
-
-		// Expand skill commands and prompt templates
-		let expandedText = this._expandSkillCommand(text);
-		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-
-		await this._queueSteer(expandedText, images);
+	async steer(
+		text: string,
+		images?: ImageContent[],
+		receipt?: MessageSubmissionReceipt,
+		scope?: RequestScope,
+	): Promise<void> {
+		await this._submitQueuedUser(text, images, "steering", receipt, scope);
 	}
 
 	/**
@@ -1352,51 +1717,87 @@ export class AgentSession {
 	 * @param images Optional image attachments to include with the message
 	 * @throws Error if text is an extension command
 	 */
-	async followUp(text: string, images?: ImageContent[]): Promise<void> {
-		// Check for extension commands (cannot be queued)
-		if (text.startsWith("/")) {
-			this._throwIfExtensionCommand(text);
+	async followUp(
+		text: string,
+		images?: ImageContent[],
+		receipt?: MessageSubmissionReceipt,
+		scope?: RequestScope,
+	): Promise<void> {
+		await this._submitQueuedUser(text, images, "followUp", receipt, scope);
+	}
+
+	private async _submitQueuedUser(
+		text: string,
+		images: ImageContent[] | undefined,
+		queue: "steering" | "followUp",
+		receipt?: MessageSubmissionReceipt,
+		scope?: RequestScope,
+	): Promise<void> {
+		this._assertManagedScope(scope);
+		const leave = this._requestLifetimes.enter(scope);
+		let invocation: EvidenceInvocation | undefined;
+		try {
+			invocation = this._messageEvidence.begin(receipt, scope?.id);
+			if (text.startsWith("/")) this._throwIfExtensionCommand(text);
+			const expandedText = expandPromptTemplate(this._expandSkillCommand(text), [...this.promptTemplates]);
+			this._requestLifetimes.check(scope);
+			this._queueUserMessage(expandedText, images, queue, invocation, scope);
+			this._messageEvidence.outcome(invocation, "submitted");
+			this._messageEvidence.finish(invocation);
+		} catch (error) {
+			this._messageEvidence.finish(invocation, String(error));
+			throw error;
+		} finally {
+			leave();
 		}
-
-		// Expand skill commands and prompt templates
-		let expandedText = this._expandSkillCommand(text);
-		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-
-		await this._queueFollowUp(expandedText, images);
 	}
 
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
-		this._steeringMessages.push(text);
-		this._emitQueueUpdate();
-		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
-		if (images) {
-			content.push(...images);
-		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+	private async _queueSteer(
+		text: string,
+		images?: ImageContent[],
+		invocation?: EvidenceInvocation,
+		scope?: RequestScope,
+	): Promise<void> {
+		this._queueUserMessage(text, images, "steering", invocation, scope);
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
-		this._followUpMessages.push(text);
-		this._emitQueueUpdate();
-		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
-		if (images) {
-			content.push(...images);
-		}
-		this.agent.followUp({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+	private async _queueFollowUp(
+		text: string,
+		images?: ImageContent[],
+		invocation?: EvidenceInvocation,
+		scope?: RequestScope,
+	): Promise<void> {
+		this._queueUserMessage(text, images, "followUp", invocation, scope);
+	}
+
+	private _queueUserMessage(
+		text: string,
+		images: ImageContent[] | undefined,
+		queue: "steering" | "followUp",
+		invocation?: EvidenceInvocation,
+		scope?: RequestScope,
+	): void {
+		this._requestLifetimes.check(scope);
+		const projection: { text: string; queueItemId?: number } = { text };
+		(queue === "steering" ? this._steeringMessages : this._followUpMessages).push(projection);
+		// Preserve the legacy pre-insertion notification for unobserved calls.
+		// Opt-in receipts register native identity before publishing any callback.
+		if (!invocation && !scope) this._emitQueueUpdate();
+		const content: (TextContent | ImageContent)[] = [
+			{ type: "text", text },
+			...((this._managedEffects ? structuredClone(images) : images) ?? []),
+		];
+		const deliveryId = this._messageEvidence.register(invocation, "user", queue);
+		const item = this.agent.enqueueMessage({ role: "user", content, timestamp: Date.now() }, queue, deliveryId);
+		projection.queueItemId = item.id;
+		this._messageEvidence.update(deliveryId, { queueItemId: item.id });
+		if (invocation || scope) this._emitQueueUpdate();
 	}
 
 	/**
@@ -1428,7 +1829,35 @@ export class AgentSession {
 	 */
 	async sendCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		options?: {
+			triggerTurn?: boolean;
+			deliverAs?: "steer" | "followUp" | "nextTurn";
+			receipt?: MessageSubmissionReceipt;
+			scope?: RequestScope;
+		},
+	): Promise<void> {
+		this._assertManagedScope(options?.scope);
+		const leave = this._requestLifetimes.enter(options?.scope);
+		let invocation: EvidenceInvocation | undefined;
+		try {
+			invocation = this._messageEvidence.begin(options?.receipt, options?.scope?.id);
+			await this._sendCustomMessage(this._managedEffects ? structuredClone(message) : message, options, invocation);
+			this._messageEvidence.outcome(invocation, "submitted");
+			this._messageEvidence.finish(invocation);
+		} catch (error) {
+			this._messageEvidence.finish(invocation, String(error));
+			throw error;
+		} finally {
+			leave();
+		}
+	}
+
+	private async _sendCustomMessage<T>(
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+		options:
+			| { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn"; scope?: RequestScope }
+			| undefined,
+		invocation: EvidenceInvocation | undefined,
 	): Promise<void> {
 		const appMessage = {
 			role: "custom" as const,
@@ -1439,26 +1868,41 @@ export class AgentSession {
 			details: message.details,
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
-		if (options?.deliverAs === "nextTurn") {
-			this._pendingNextTurnMessages.push(appMessage);
-		} else if (this.isStreaming) {
-			if (options?.deliverAs === "followUp") {
-				this.agent.followUp(appMessage);
-			} else {
-				this.agent.steer(appMessage);
-			}
+		const placement =
+			options?.deliverAs === "nextTurn"
+				? "nextTurn"
+				: this.isStreaming
+					? options?.deliverAs === "followUp"
+						? "followUp"
+						: "steering"
+					: "direct";
+		this._requestLifetimes.check(options?.scope);
+		const reserved =
+			placement === "direct" && options?.triggerTurn ? this._requestLifetimes.reserve(options.scope) : undefined;
+		const deliveryId = this._messageEvidence.register(invocation, "custom", placement);
+		if (placement === "nextTurn") {
+			this._pendingNextTurnMessages.push({ message: appMessage, deliveryId });
+			this._messageEvidence.accept(deliveryId);
+		} else if (placement === "steering" || placement === "followUp") {
+			const item = this.agent.enqueueMessage(appMessage, placement, deliveryId);
+			this._messageEvidence.update(deliveryId, { queueItemId: item.id });
 		} else if (options?.triggerTurn) {
-			await this._runAgentPrompt(appMessage);
+			await this._runAgentPrompt(appMessage, deliveryId ? new Map([[appMessage, deliveryId]]) : undefined, reserved);
 		} else {
+			if (this._requestLifetimes.snapshot()) {
+				throw new Error("Cannot append an idle custom message while session execution is owned");
+			}
 			this.agent.state.messages.push(appMessage);
-			this.sessionManager.appendCustomMessageEntry(
-				message.customType,
-				message.content,
-				message.display,
-				message.details,
+			this._messageEvidence.accept(deliveryId);
+			const entryId = this.sessionManager.appendCustomMessageEntry(
+				appMessage.customType,
+				appMessage.content,
+				appMessage.display,
+				appMessage.details,
 			);
-			this._emit({ type: "message_start", message: appMessage });
-			this._emit({ type: "message_end", message: appMessage });
+			this._messageEvidence.update(deliveryId, { started: true, entryId });
+			this._emit({ type: "message_start", message: appMessage, ...(deliveryId ? { deliveryId } : {}) });
+			this._emit({ type: "message_end", message: appMessage, ...(deliveryId ? { deliveryId } : {}) });
 		}
 	}
 
@@ -1471,7 +1915,7 @@ export class AgentSession {
 	 */
 	async sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp" },
+		options?: { deliverAs?: "steer" | "followUp"; receipt?: MessageSubmissionReceipt; scope?: RequestScope },
 	): Promise<void> {
 		// Normalize content to text string + optional images
 		let text: string;
@@ -1499,6 +1943,8 @@ export class AgentSession {
 			streamingBehavior: options?.deliverAs,
 			images,
 			source: "extension",
+			receipt: options?.receipt,
+			scope: options?.scope,
 		});
 	}
 
@@ -1508,13 +1954,45 @@ export class AgentSession {
 	 * @returns Object with steering and followUp arrays
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
-		const steering = [...this._steeringMessages];
-		const followUp = [...this._followUpMessages];
+		this._assertLegacyOperation("clearQueue; use targeted removal receipts");
+		const steering = this._steeringMessages.map((item) => item.text);
+		const followUp = this._followUpMessages.map((item) => item.text);
 		this._steeringMessages = [];
 		this._followUpMessages = [];
-		this.agent.clearAllQueues();
+		const removed = this.agent.clearQueuedMessages();
+		for (const item of [...removed.steering, ...removed.followUp])
+			this._messageEvidence.update(item.deliveryId, { removed: true });
 		this._emitQueueUpdate();
 		return { steering, followUp };
+	}
+
+	/** Remove exactly these native occurrences. Publication failure does not erase the removal receipt. */
+	removeQueuedMessages(ids: readonly number[]): { removed: AgentQueueRemoval; displayError?: string } {
+		const removed = this.agent.removeQueuedMessages(ids);
+		const actual = [...removed.steering, ...removed.followUp];
+		const selected = new Set(actual.map((item) => item.id));
+		this._steeringMessages = this._steeringMessages.filter((item) => !selected.has(item.queueItemId!));
+		this._followUpMessages = this._followUpMessages.filter((item) => !selected.has(item.queueItemId!));
+		for (const item of actual) this._messageEvidence.update(item.deliveryId, { removed: true });
+		try {
+			this._emitQueueUpdate();
+			return { removed };
+		} catch (error) {
+			return { removed, displayError: String(error) };
+		}
+	}
+
+	/** Remove only tracked nextTurn deliveries still owned by that holding queue, not a claimed prompt batch. */
+	removeNextTurnMessages(ids: readonly string[]): readonly string[] {
+		const selected = new Set(ids);
+		const removed: string[] = [];
+		this._pendingNextTurnMessages = this._pendingNextTurnMessages.filter((item) => {
+			if (!item.deliveryId || !selected.has(item.deliveryId)) return true;
+			removed.push(item.deliveryId);
+			this._messageEvidence.update(item.deliveryId, { removed: true });
+			return false;
+		});
+		return removed;
 	}
 
 	/** Number of pending messages (includes both steering and follow-up) */
@@ -1524,12 +2002,12 @@ export class AgentSession {
 
 	/** Get pending steering messages (read-only) */
 	getSteeringMessages(): readonly string[] {
-		return this._steeringMessages;
+		return this._steeringMessages.map((item) => item.text);
 	}
 
 	/** Get pending follow-up messages (read-only) */
 	getFollowUpMessages(): readonly string[] {
-		return this._followUpMessages;
+		return this._followUpMessages.map((item) => item.text);
 	}
 
 	get resourceLoader(): ResourceLoader {
@@ -1540,6 +2018,7 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		this._assertLegacyOperation("abort; use stopExecution with a captured ID");
 		this.abortRetry();
 		this.agent.abort();
 		await this.waitForIdle();
@@ -1575,21 +2054,29 @@ export class AgentSession {
 	 * Validates that auth is configured, saves to session and settings.
 	 * @throws Error if no auth is configured for the model
 	 */
-	async setModel(model: Model<any>): Promise<void> {
-		if (!(await this._modelRuntime.checkAuth(model.provider))) {
-			throw new Error(`No API key for ${model.provider}/${model.id}`);
-		}
-
+	async setModel(model: Model<any>, scope?: RequestScope): Promise<void> {
+		this._assertManagedScope(scope);
+		const leave = this._requestLifetimes.enter(scope);
 		const previousModel = this.model;
-		const thinkingLevel = this._getThinkingLevelForModelSwitch();
-		this.agent.state.model = model;
-		this.sessionManager.appendModelChange(model.provider, model.id);
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
-
-		// Re-clamp thinking level for new model's capabilities
-		this.setThinkingLevel(thinkingLevel);
-
-		await this._emitModelSelect(model, previousModel, "set");
+		const previousContext = this._conversationVersion();
+		const selected = this._managedEffects ? structuredClone(model) : model;
+		try {
+			const auth = await this._modelRuntime.checkAuth(selected.provider);
+			this._requestLifetimes.check(scope);
+			if (!auth) throw new Error(`No API key for ${selected.provider}/${selected.id}`);
+			if (scope && (previousModel !== this.model || previousContext !== this._conversationVersion()))
+				throw new StalePreparationError();
+			this._commitConfiguration(scope, () => {
+				const thinkingLevel = this._getThinkingLevelForModelSwitch();
+				this.agent.state.model = selected;
+				this.sessionManager.appendModelChange(selected.provider, selected.id);
+				this.settingsManager.setDefaultModelAndProvider(selected.provider, selected.id);
+				this._setThinkingLevel(thinkingLevel);
+			});
+			await this._emitModelSelect(selected, previousModel, "set");
+		} finally {
+			leave();
+		}
 	}
 
 	/**
@@ -1599,6 +2086,7 @@ export class AgentSession {
 	 * @returns The new model info, or undefined if only one model available
 	 */
 	async cycleModel(direction: "forward" | "backward" = "forward"): Promise<ModelCycleResult | undefined> {
+		this._assertLegacyOperation("cycleModel");
 		if (this._scopedModels.length > 0) {
 			return this._cycleScopedModel(direction);
 		}
@@ -1675,6 +2163,11 @@ export class AgentSession {
 	 * Saves to session and settings only if the level actually changes.
 	 */
 	setThinkingLevel(level: ThinkingLevel): void {
+		this._assertLegacyOperation("setThinkingLevel; use request effects");
+		this._setThinkingLevel(level);
+	}
+
+	private _setThinkingLevel(level: ThinkingLevel): void {
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
@@ -1703,6 +2196,7 @@ export class AgentSession {
 	 * @returns New level, or undefined if model doesn't support thinking
 	 */
 	cycleThinkingLevel(): ThinkingLevel | undefined {
+		this._assertLegacyOperation("cycleThinkingLevel");
 		if (!this.supportsThinking()) return undefined;
 
 		const levels = this.getAvailableThinkingLevels();
@@ -1758,6 +2252,7 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
+		this._assertLegacyOperation("setSteeringMode");
 		this.agent.steeringMode = mode;
 		this.settingsManager.setSteeringMode(mode);
 	}
@@ -1767,6 +2262,7 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setFollowUpMode(mode: "all" | "one-at-a-time"): void {
+		this._assertLegacyOperation("setFollowUpMode");
 		this.agent.followUpMode = mode;
 		this.settingsManager.setFollowUpMode(mode);
 	}
@@ -1781,6 +2277,7 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		this._assertLegacyOperation("manual compact");
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
@@ -1928,6 +2425,11 @@ export class AgentSession {
 	 * Cancel in-progress compaction (manual or auto).
 	 */
 	abortCompaction(): void {
+		this._assertLegacyOperation("abortCompaction; use captured execution control");
+		this._abortCompaction();
+	}
+
+	private _abortCompaction(): void {
 		this._compactionAbortController?.abort();
 		this._autoCompactionAbortController?.abort();
 	}
@@ -1936,6 +2438,11 @@ export class AgentSession {
 	 * Cancel in-progress branch summarization.
 	 */
 	abortBranchSummary(): void {
+		this._assertLegacyOperation("abortBranchSummary");
+		this._abortBranchSummary();
+	}
+
+	private _abortBranchSummary(): void {
 		this._branchSummaryAbortController?.abort();
 	}
 
@@ -1950,7 +2457,12 @@ export class AgentSession {
 	 * @param assistantMessage The assistant message to check
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 */
-	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
+	private async _checkCompaction(
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck = true,
+		assertCurrent?: () => void,
+	): Promise<boolean> {
+		assertCurrent?.();
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
@@ -1984,7 +2496,7 @@ export class AgentSession {
 			const willRetry = assistantMessage.stopReason !== "stop";
 
 			if (!willRetry) {
-				return await this._runAutoCompaction("overflow", false);
+				return await this._runAutoCompaction("overflow", false, assertCurrent);
 			}
 
 			if (this._overflowRecoveryAttempted) {
@@ -2007,7 +2519,7 @@ export class AgentSession {
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this.agent.state.messages = messages.slice(0, -1);
 			}
-			return await this._runAutoCompaction("overflow", willRetry);
+			return await this._runAutoCompaction("overflow", willRetry, assertCurrent);
 		}
 
 		// Case 2: Threshold - context is getting large
@@ -2036,7 +2548,7 @@ export class AgentSession {
 			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
-			return await this._runAutoCompaction("threshold", false);
+			return await this._runAutoCompaction("threshold", false, assertCurrent);
 		}
 		return false;
 	}
@@ -2044,7 +2556,11 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		assertCurrent?: () => void,
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
 
@@ -2061,6 +2577,7 @@ export class AgentSession {
 			} else {
 				({ apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model));
 			}
+			assertCurrent?.();
 
 			const pathEntries = this.sessionManager.getBranch();
 
@@ -2069,9 +2586,10 @@ export class AgentSession {
 				return false;
 			}
 
-			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();
 			started = true;
+			this._emit({ type: "compaction_start", reason });
+			assertCurrent?.();
 
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
@@ -2086,6 +2604,7 @@ export class AgentSession {
 					willRetry,
 					signal: this._autoCompactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
+				assertCurrent?.();
 
 				if (extensionResult?.cancel) {
 					this._emit({
@@ -2139,6 +2658,7 @@ export class AgentSession {
 				details = compactResult.details;
 			}
 
+			assertCurrent?.();
 			if (this._autoCompactionAbortController.signal.aborted) {
 				this._emit({
 					type: "compaction_end",
@@ -2218,6 +2738,7 @@ export class AgentSession {
 	 * Toggle auto-compaction setting.
 	 */
 	setAutoCompactionEnabled(enabled: boolean): void {
+		this._assertLegacyOperation("setAutoCompactionEnabled");
 		this.settingsManager.setCompactionEnabled(enabled);
 	}
 
@@ -2227,6 +2748,7 @@ export class AgentSession {
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
+		this._extensionsBound = true;
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
 		}
@@ -2357,6 +2879,7 @@ export class AgentSession {
 		runner.bindCore(
 			{
 				sendMessage: (message, options) => {
+					this._assertManagedScope();
 					this.sendCustomMessage(message, options).catch((err) => {
 						runner.emitError({
 							extensionPath: "<runtime>",
@@ -2366,6 +2889,7 @@ export class AgentSession {
 					});
 				},
 				sendUserMessage: (content, options) => {
+					this._assertManagedScope();
 					this.sendUserMessage(content, options).catch((err) => {
 						runner.emitError({
 							extensionPath: "<runtime>",
@@ -2375,6 +2899,7 @@ export class AgentSession {
 					});
 				},
 				appendEntry: (customType, data) => {
+					this._assertManagedScope();
 					const entryId = this.sessionManager.appendCustomEntry(customType, data);
 					const entry = this.sessionManager.getEntry(entryId);
 					if (entry) {
@@ -2388,14 +2913,19 @@ export class AgentSession {
 					return this.sessionManager.getSessionName();
 				},
 				setLabel: (entryId, label) => {
+					this._assertManagedScope();
 					this.sessionManager.appendLabelChange(entryId, label);
 				},
 				getActiveTools: () => this.getActiveToolNames(),
 				getAllTools: () => this.getAllTools(),
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
-				refreshTools: () => this._refreshToolRegistry(),
+				refreshTools: () => {
+					this._assertLegacyOperation("dynamic tool registration");
+					this._refreshToolRegistry();
+				},
 				getCommands,
 				setModel: async (model) => {
+					this._assertManagedScope();
 					if (!this._modelRuntime.hasConfiguredAuth(model.provider)) return false;
 					await this.setModel(model);
 					return true;
@@ -2404,12 +2934,14 @@ export class AgentSession {
 				setThinkingLevel: (level) => this.setThinkingLevel(level),
 			},
 			{
+				isManagedEffects: () => this._managedEffects,
 				getModel: () => this.model,
 				getScopedModels: () => this._scopedModels,
 				isIdle: () => this.isIdle,
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 				getSignal: () => this.agent.signal,
 				abort: () => {
+					this._assertLegacyOperation("ambient extension abort");
 					if (this._extensionAbortHandler) {
 						this._extensionAbortHandler();
 						return;
@@ -2418,10 +2950,12 @@ export class AgentSession {
 				},
 				hasPendingMessages: () => this.pendingMessageCount > 0,
 				shutdown: () => {
+					this._assertLegacyOperation("ambient extension shutdown");
 					this._extensionShutdownHandler?.();
 				},
 				getContextUsage: () => this.getContextUsage(),
 				compact: (options) => {
+					this._assertLegacyOperation("ambient extension compaction");
 					void (async () => {
 						try {
 							const result = await this.compact(options?.customInstructions);
@@ -2437,14 +2971,17 @@ export class AgentSession {
 			},
 			{
 				registerProvider: (name, config) => {
+					this._assertLegacyOperation("dynamic provider registration");
 					this._modelRuntime.registerProvider(name, config);
 					this._refreshCurrentModelFromRegistry();
 				},
 				registerNativeProvider: (provider) => {
+					this._assertLegacyOperation("dynamic provider registration");
 					this._modelRuntime.registerNativeProvider(provider);
 					this._refreshCurrentModelFromRegistry();
 				},
 				unregisterProvider: (name) => {
+					this._assertLegacyOperation("dynamic provider unregistration");
 					this._modelRuntime.unregisterProvider(name);
 					this._refreshCurrentModelFromRegistry();
 				},
@@ -2542,7 +3079,7 @@ export class AgentSession {
 			}
 		}
 
-		this.setActiveToolsByName([...new Set(nextActiveToolNames)]);
+		this._setActiveToolsByName([...new Set(nextActiveToolNames)]);
 	}
 
 	private _buildRuntime(options: {
@@ -2600,6 +3137,7 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		this._assertLegacyOperation("reload");
 		const previousFlagValues = this._extensionRunner.getFlagValues();
 		await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
 		await this.settingsManager.reload();
@@ -2673,7 +3211,8 @@ export class AgentSession {
 	 * Prepare a retryable error for continuation with exponential backoff.
 	 * @returns true if the caller should continue the agent, false otherwise
 	 */
-	private async _prepareRetry(message: AssistantMessage): Promise<boolean> {
+	private async _prepareRetry(message: AssistantMessage, assertCurrent: () => void): Promise<boolean> {
+		assertCurrent();
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled) {
 			return false;
@@ -2696,6 +3235,7 @@ export class AgentSession {
 			delayMs,
 			errorMessage: message.errorMessage || "Unknown error",
 		});
+		assertCurrent();
 
 		// Remove error message from agent state (keep in session for history)
 		const messages = this.agent.state.messages;
@@ -2729,6 +3269,11 @@ export class AgentSession {
 	 * Cancel in-progress retry.
 	 */
 	abortRetry(): void {
+		this._assertLegacyOperation("abortRetry; use captured execution control");
+		this._abortRetry();
+	}
+
+	private _abortRetry(): void {
 		this._retryAbortController?.abort();
 	}
 
@@ -2746,6 +3291,7 @@ export class AgentSession {
 	 * Toggle auto-retry setting.
 	 */
 	setAutoRetryEnabled(enabled: boolean): void {
+		this._assertLegacyOperation("setAutoRetryEnabled");
 		this.settingsManager.setRetryEnabled(enabled);
 	}
 
@@ -2767,6 +3313,7 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
 	): Promise<BashResult> {
+		this._assertLegacyOperation("executeBash");
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
 
@@ -2801,6 +3348,7 @@ export class AgentSession {
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		this._assertLegacyOperation("recordBashResult");
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
 			command,
@@ -2830,6 +3378,11 @@ export class AgentSession {
 	 * Cancel running bash command.
 	 */
 	abortBash(): void {
+		this._assertLegacyOperation("abortBash");
+		this._abortBash();
+	}
+
+	private _abortBash(): void {
 		for (const abortController of [...this._bashAbortControllers]) {
 			abortController.abort();
 		}
@@ -2871,6 +3424,7 @@ export class AgentSession {
 	 * Set a display name for the current session.
 	 */
 	setSessionName(name: string): void {
+		this._assertLegacyOperation("setSessionName; use request effects");
 		this.sessionManager.appendSessionInfo(name);
 		const event = { type: "session_info_changed", name: this.sessionManager.getSessionName() } as const;
 		this._emit(event);
@@ -2896,6 +3450,7 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		this._assertLegacyOperation("navigateTree");
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
 		}

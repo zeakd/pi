@@ -49,6 +49,32 @@ export type ToolExecutionMode = "sequential" | "parallel";
  */
 export type QueueMode = "all" | "one-at-a-time";
 
+/** One native enqueue occurrence. IDs are unique within an Agent, not by message value or object identity. */
+export interface QueuedMessage {
+	readonly id: number;
+	readonly queue: "steering" | "followUp";
+	readonly message: AgentMessage;
+	/** Optional opaque delivery tag, never added to the model message. */
+	readonly deliveryId?: string;
+}
+
+/** Native queue membership, not the session's text-only display queue.
+ * Arrays are snapshots; message objects remain the caller's objects.
+ * Claimed items have left the queues and cannot be removed by clearing them.
+ * They remain here until message_end or run settlement, which may occur without delivery on failure.
+ */
+export interface AgentQueueSnapshot {
+	readonly steering: readonly QueuedMessage[];
+	readonly followUp: readonly QueuedMessage[];
+	readonly claimed: readonly QueuedMessage[];
+}
+
+/** Items actually removed from the native queues by one synchronous clear. Excludes claimed items. */
+export interface AgentQueueRemoval {
+	readonly steering: readonly QueuedMessage[];
+	readonly followUp: readonly QueuedMessage[];
+}
+
 /** A single tool call content block emitted by an assistant message. */
 export type AgentToolCall = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 
@@ -427,10 +453,10 @@ export type AgentEvent =
 	| { type: "turn_start" }
 	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
 	// Message lifecycle - emitted for user, assistant, and toolResult messages
-	| { type: "message_start"; message: AgentMessage }
+	| { type: "message_start"; message: AgentMessage; queueItemId?: number; deliveryId?: string }
 	// Only emitted for assistant messages during streaming
 	| { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
-	| { type: "message_end"; message: AgentMessage }
+	| { type: "message_end"; message: AgentMessage; queueItemId?: number; deliveryId?: string }
 	// Tool execution lifecycle
 	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
 	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }

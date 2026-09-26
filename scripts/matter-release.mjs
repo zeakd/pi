@@ -1,12 +1,26 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { packReleasePackages } from "./coding-agent-consumer.mjs";
 import { getPublicWorkspacePackages } from "./release-packages.mjs";
+
+export function directoryDigest(directory) {
+	const hash = createHash("sha256");
+	function visit(relative) {
+		for (const entry of readdirSync(join(directory, relative), { withFileTypes: true }).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
+			const name = relative ? `${relative}/${entry.name}` : entry.name;
+			if (entry.isDirectory()) visit(name);
+			else if (entry.isFile()) hash.update(name).update("\0").update(readFileSync(join(directory, name)));
+			else throw new Error(`Unexpected catalog entry: ${name}`);
+		}
+	}
+	visit("");
+	return hash.digest("hex");
+}
 
 export function releaseVersion(tag, upstreamVersion) {
 	const match = /^matter-(\d+\.\d+\.\d+)-([1-9]\d*)$/.exec(tag);
@@ -48,6 +62,7 @@ export function stageManifest(manifest, version, urls, sourceSha) {
 }
 
 export function packMatterRelease(tag, output) {
+	if (execFileSync("git", ["status", "--porcelain"], { encoding: "utf8" }).trim()) throw new Error("Commit source changes before packing a release");
 	const catalog = new Map(getPublicWorkspacePackages().map((pkg) => [pkg.name, {
 		...pkg, manifest: JSON.parse(readFileSync(join(pkg.directory, "package.json"), "utf8")),
 	}]));
@@ -58,12 +73,16 @@ export function packMatterRelease(tag, output) {
 	const names = Object.fromEntries(packages.map((pkg) => [pkg.name, `${pkg.name.replace(/^@/, "").replaceAll("/", "-")}-${version}.tgz`]));
 	const urls = Object.fromEntries(Object.entries(names).map(([name, file]) => [name, `https://github.com/zeakd/pi/releases/download/${tag}/${file}`]));
 	const destination = resolve(output);
+	const upstream = JSON.parse(readFileSync("matter-upstream.json", "utf8"));
+	if (upstream.version !== upstreamVersion) throw new Error("Update matter-upstream.json with the selected upstream release");
+	const catalogSha256 = directoryDigest("packages/ai/src/providers/data");
+	if (catalogSha256 !== upstream.modelDataSha256 || directoryDigest("packages/ai/dist/providers/data") !== catalogSha256) {
+		throw new Error("Source and built model catalogs must match the pinned upstream catalog");
+	}
 	if (existsSync(destination)) throw new Error(`Output already exists: ${destination}`);
 	mkdirSync(destination, { recursive: true });
 	const temporary = mkdtempSync(join(tmpdir(), "pi-matter-pack-"));
-	const upstream = JSON.parse(readFileSync("matter-upstream.json", "utf8"));
-	if (upstream.version !== upstreamVersion) throw new Error("Update matter-upstream.json with the selected upstream release");
-	const manifest = { schema: 1, tag, version, upstreamVersion, sourceSha, upstream, packages: [] };
+	const manifest = { schema: 1, tag, version, upstreamVersion, sourceSha, upstream, catalogSha256, packages: [] };
 	try {
 		const originals = packReleasePackages(packages, join(temporary, "originals"));
 		for (const pkg of packages) {

@@ -8,7 +8,7 @@ Push a tag `matter-X.Y.Z-N` on a tested commit already merged into `matter/main`
 
 For example, `matter-0.87.1-1` produces `0.87.1-matter.1` packages. The Matter SDK workflow tests and builds that commit, installs the packed packages with npm and Bun, then publishes a GitHub prerelease. Branch pushes and PRs targeting `matter/main` verify without publishing. The tag trigger keeps the workflow off the upstream mirror and avoids upstream's `v*` publishing trigger.
 
-Repository setup: enable immutable releases and disable the inherited Build Binaries and Publish Model Catalog workflows in the fork's Actions settings. These settings preserve the mirrored files. This workflow needs only GitHub's repository token, not npm or upstream service credentials.
+Repository setup: enable immutable releases and disable the inherited Build Binaries and Publish Model Catalog workflows in the fork's Actions settings. Protect `matter-*` tags against updates and deletion with an active tag ruleset. Before publication, the workflow rechecks the tag commit and uploaded asset digests; after publication it verifies release immutability. These settings preserve the mirrored files. This workflow needs only GitHub's repository token, not npm or upstream service credentials.
 
 The release contains the coding-agent runtime dependency closure (currently coding-agent, agent-core, ai, tui, chord and telemetry), `manifest.json`, `consumer.json`, `SHA256SUMS`, and the model catalog used for the build. `matter-upstream.json` pins the upstream commit and source archive checksum. Preparation extracts the release's catalog from that verified archive, avoiding a live catalog refresh. Update this file together with each upstream upgrade. Model catalog changes are an explicit build-input change.
 
@@ -24,7 +24,7 @@ node scripts/matter-release.mjs matter-0.87.1-1 .artifacts/matter-release
 node scripts/verify-matter-release.mjs .artifacts/matter-release
 ```
 
-Use a new output directory for each packaging attempt. The verifier checks npm/Node SDK and CLI startup, Bun SDK and unbundled CLI startup, source/version identity, one installed instance per fork package, and a frozen production reinstall. The bundled Node CLI is not a Bun CLI distribution. These checks do not call a model provider.
+Commit all changes before packaging; packaging requires a clean tree and verifies that source and built model catalogs match the pinned catalog digest. Use a new output directory for each packaging attempt. The verifier checks npm/Node SDK and CLI startup, Bun SDK and unbundled CLI startup, source/version identity, one installed instance per fork package, a frozen production reinstall, and HTTP URL installation with lockfile integrity and tampered asset rejection. The bundled Node CLI is not a Bun CLI distribution. These checks do not call a model provider.
 
 ## Matter adoption
 

@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { releaseVersion, runtimePackages, stageManifest } from "./matter-release.mjs";
+import { verifyReleaseAssets } from "./publish-matter-release.mjs";
+
+test("publishing rejects replaced, missing and extra assets", () => {
+	const hashes = { "package.tgz": "a".repeat(64) };
+	const asset = { name: "package.tgz", digest: `sha256:${hashes["package.tgz"]}` };
+	verifyReleaseAssets([asset], hashes);
+	assert.throws(() => verifyReleaseAssets([{ ...asset, digest: `sha256:${"b".repeat(64)}` }], hashes));
+	assert.throws(() => verifyReleaseAssets([], hashes));
+	assert.throws(() => verifyReleaseAssets([asset, { name: "extra", digest: asset.digest }], hashes));
+});
 
 test("release identity must match the upstream package version", () => {
 	assert.equal(releaseVersion("matter-0.87.1-2", "0.87.1"), "0.87.1-matter.2");

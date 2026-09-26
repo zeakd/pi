@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { directoryDigest } from "./matter-release.mjs";
 
 const config = JSON.parse(readFileSync("matter-upstream.json", "utf8"));
 assert.match(config.version, /^\d+\.\d+\.\d+$/);
@@ -23,6 +24,7 @@ try {
 	writeFileSync(archive, bytes);
 	const directory = `pi-${config.version}/packages/ai/src/providers/data`;
 	execFileSync("tar", ["-xzf", archive, "-C", temporary, directory]);
+	assert.equal(directoryDigest(join(temporary, directory)), config.modelDataSha256, "Pinned model catalog mismatch");
 	const target = "packages/ai/src/providers/data";
 	rmSync(target, { recursive: true, force: true });
 	cpSync(join(temporary, directory), target, { recursive: true });

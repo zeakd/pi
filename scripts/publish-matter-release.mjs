@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -35,17 +35,20 @@ function publish(directory) {
 	const api = (path) => JSON.parse(gh(["api", `repos/zeakd/pi/${path}`]));
 	const assertTag = () => assert.equal(api(`commits/${tag}`).sha, sha, "Release tag moved since verification");
 	assertTag();
-	// Creation fails on an existing release; no overwrite or automatic recovery path is used.
-	const notes = join(directory, "RELEASE_NOTES.md");
-	writeFileSync(notes, `Matter SDK ${manifest.version}\n\nUpstream: ${manifest.upstreamVersion}\nSource: ${sha}\n\nUse consumer.json for dependency URLs and root overrides. SHA256SUMS covers the package set and build catalog. The consumer owns its installation lockfile. No npm packages are published.\n`);
-	gh(["release", "create", tag, "--verify-tag", "--draft", "--prerelease", "--title", tag, "--notes-file", notes,
-		...Object.keys(checksums).map((file) => join(directory, file))]);
-	const id = gh(["release", "view", tag, "--json", "databaseId", "--jq", ".databaseId"]);
+	const releases = JSON.parse(gh(["api", "repos/zeakd/pi/releases", "--paginate", "--slurp"])).flat();
+	assert.ok(!releases.some((release) => release.tag_name === tag), "Release or draft already exists; inspect it before retrying");
+	const notes = `Matter SDK ${manifest.version}\n\nUpstream: ${manifest.upstreamVersion}\nSource: ${sha}\n\nUse consumer.json for dependency URLs and root overrides. SHA256SUMS covers the package set and build catalog. The consumer owns its installation lockfile. No npm packages are published.\n`;
+	const created = JSON.parse(gh(["api", "repos/zeakd/pi/releases", "--method", "POST", "-f", `tag_name=${tag}`,
+		"-f", `name=${tag}`, "-f", `body=${notes}`, "-F", "draft=true", "-F", "prerelease=true"]));
+	const id = created.id;
+	assert.equal(created.tag_name, tag);
+	assert.equal(created.draft, true);
+	gh(["release", "upload", tag, ...Object.keys(checksums).map((file) => join(directory, file))]);
 	const draft = api(`releases/${id}`);
 	assert.equal(draft.draft, true);
 	verifyReleaseAssets(draft.assets, checksums);
 	assertTag();
-	gh(["release", "edit", tag, "--draft=false", "--latest=false"]);
+	gh(["api", `repos/zeakd/pi/releases/${id}`, "--method", "PATCH", "-F", "draft=false", "-f", "make_latest=false"]);
 	const published = api(`releases/${id}`);
 	assert.equal(published.draft, false);
 	assert.equal(published.immutable, true, "Enable immutable releases before publishing");

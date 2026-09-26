@@ -35,3 +35,5 @@ Pi release and Matter adoption are separate operations. Publishing Pi does not c
 ## Recovery
 
 A failed build publishes nothing. A failed upload leaves a draft for inspection. The workflow refuses to replace an existing release. For an incomplete draft, inspect the tag and uploaded assets, then explicitly remove that draft before retrying the same tag's workflow. Published releases are never replaced. If code must change, use a new commit and release number.
+
+If verification fails after publication, inspect the public release before adoption. Matter adoption rejects mutable releases. If immutability was disabled, enable it and publish a new release number; do not adopt the failed release.

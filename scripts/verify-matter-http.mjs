@@ -29,6 +29,9 @@ export async function verifyHttpConsumer(directory, temporary, manifest, checkGr
 			for (const [name, url] of Object.entries(config[field])) {
 				const original = new URL(url);
 				assert.equal(original.origin, "https://github.com");
+				const pkg = manifest.packages.find((entry) => entry.name === name);
+				assert.ok(pkg, `Unknown consumer package: ${name}`);
+				assert.equal(original.pathname, `/zeakd/pi/releases/download/${manifest.tag}/${pkg.filename}`);
 				config[field][name] = `http://127.0.0.1:${port}${original.pathname}`;
 			}
 		}
@@ -44,7 +47,8 @@ export async function verifyHttpConsumer(directory, temporary, manifest, checkGr
 		assert.equal(readFileSync(join(consumer, "bun.lock"), "utf8"), lock);
 		checkGraph(consumer);
 		rmSync(join(consumer, "node_modules"), { recursive: true });
-		writeFileSync(join(assets, manifest.packages[0].filename), "tampered release asset");
+		assert.ok(manifest.packages.length > 1);
+		copyFileSync(join(assets, manifest.packages[1].filename), join(assets, manifest.packages[0].filename));
 		const rejected = spawnSync("bun", [...args, "--production", "--frozen-lockfile"], {
 			cwd: consumer, env: { ...env, BUN_INSTALL_CACHE_DIR: join(temporary, "tamper-cache") }, encoding: "utf8",
 		});
